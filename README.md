@@ -15,10 +15,10 @@
 | `pkg/model` | 事件、规则、规则集、判定结果、隔离记录等领域类型；幂等键与内容指纹 |
 | `pkg/auth` | 基于租户 + 角色的静态授权矩阵 |
 | `pkg/store` | 事件/结果/隔离区的内存存储（互斥锁、按租户隔离、结果槽位不可变） |
-| `pkg/rules` | 版本化规则集注册表：严格校验、发布、回滚、按事件发生时间选取生效版本 |
-| `pkg/engine` | 规则判定纯函数、单事件评估、历史重算、规则切换后的当前结果补齐 |
+| `pkg/rules` | 版本化规则集注册表：严格校验、发布、回滚、生效时间轴与按时刻选取生效版本 |
+| `pkg/engine` | 规则判定纯函数、单事件评估、只读预演、历史重算、规则切换后的当前结果补齐 |
 | `pkg/ingest` | 事件接入：校验、幂等归并、乱序/迟到处理、隔离、令牌限流与信号量背压 |
-| `pkg/service` | 门面：串联鉴权 + 各组件，以租户为粒度串行化写入/切换/重算 |
+| `pkg/service` | 门面：串联鉴权 + 各组件，以租户为粒度串行化写入/切换/重算/预演 |
 
 ## 一、事件语义
 
@@ -83,14 +83,47 @@
 - 事件判定使用**事件发生时刻已生效的最新版本**
   （`Registry.EffectiveAt(occurredAt)`），因此规则更新后旧事件仍按其发生时
   的版本复现结论。
-- **回滚**只把“当前生效指针”移到上一版本，不删除任何历史版本；回滚后
-  再发布仍在序列尾部递增版本号（v3 ...）。
+- **回滚**把“当前生效指针”移回上一版本，不删除任何历史版本；回滚后
+  再发布仍在序列尾部递增版本号（v3 ...）。已经没有更早版本可回滚时返回
+  `rules.ErrNothingToRollback`，生效状态完全不变。
 - 结果以 `(事件, 规则版本)` 为槽位存储且**只写一次、不可覆盖**：
   - 发布/回滚后由 `RefillCurrent` 为当前版本补齐缺失槽位，使“当前查询”反映当前规则；
   - `Recompute` 为每个历史版本补齐缺失槽位，使任意历史版本都可查询；
   - 已存在槽位严格保留原结论，重算天然幂等（第二次重算补齐数为 0）。
 - 查询时 `ruleVersion <= 0` 表示当前生效版本；显式传版本号查询该历史版本结论，
   结果中 `Recomputed` 标记该槽位是否由重算补齐。
+
+### 生效时间轴与按时刻追溯
+
+- `RuleTimeline(tenantID)` 返回规则版本的**生效时间轴**：每次发布/回滚都
+  产生一段半开区间 `[EffectiveFrom, EffectiveTo)`，`EffectiveTo` 为零值表示
+  至今生效；回滚以 `Cause=rollback` 的区间体现（区间版本为回滚目标版本）。
+- 边界约定为**左闭右开**：恰好落在边界上的时刻只属于右侧区间，
+  任意时刻至多命中一个版本，不存在同一时刻命中两个矛盾版本的情况。
+- `EffectiveRulesAt(tenantID, t)` 返回任意时刻 t 真正生效的版本；
+  首次生效之前的时刻返回 `rules.ErrNoRuleSet`。
+
+### 规则变更预演（Dry-Run）
+
+- `DryRunRules(candidate)` 预演“若发布该候选规则集”：按租户**已有**审计事件
+  预跑一遍，逐条给出 `当前版本结论 -> 候选结论`、是否变化及命中依据
+  （`DryRunReport.Items`），候选版本号展示为“若现在发布将分配的下一版本号”。
+- `DryRunRollback()` 预演“若回滚到上一历史版本”：候选规则为回滚目标版本；
+  没有可回滚版本时返回 `rules.ErrNothingToRollback`。
+- 预演**只读**：不修改生效规则、不写入任何判定结果槽位、不触碰隔离区，
+  临时结论不会混入任何正式查询；候选规则集与正式发布走同一套严格校验。
+- 预演全程持有租户串行锁，与事件写入/发布/回滚/重算互斥，
+  因此拿到的是前后一致的快照，不会出现“半截数据”。
+
+### 回滚之后的闭环
+
+- 回滚生效后，**新发生**（发生时间在回滚生效时刻之后）的事件按回滚后
+  当前生效版本判定，并直接出现在当前版本查询中。
+- 回滚后才到达的**乱序旧事件**仍按发生时版本落槽（历史可复现），同时
+  接入路径会为当前生效版本补齐槽位，保证“判定用的版本”和“当前查询能看到
+  的版本”不会脱节。
+- 发布、回滚、重算、写入并发时，每个 `(事件, 版本)` 槽位仍只写一次，
+  结论唯一且稳定（见并发一致性一节与对应测试）。
 
 ## 三、权限边界
 
@@ -143,9 +176,11 @@ go build ./...
 go test -race ./...
 
 # 查看关键用例的诊断日志（输入 / 规则版本 / 判定依据 / 最终结果）
-go test ./pkg/service/ -run 'TestEndToEndRollbackAndRecompute|TestConcurrent' -v
+go test ./pkg/service/ -run 'TestEndToEndRollbackAndRecompute|TestConcurrent|TestDryRun|TestRollbackClosesLoop' -v
+go test ./pkg/rules/ -run TestTimelineBoundariesAndEffectiveAt -v
 
-# 端到端离线演示：重复、乱序/迟到、冲突、v2 发布、重算、回滚、越权、非法规则
+# 端到端离线演示：重复、乱序/迟到、冲突、v2 发布、预演、时间轴、重算、
+# 回滚及回滚后新事件闭环、越权、非法规则
 go run ./cmd/audit-demo
 ```
 
@@ -160,8 +195,13 @@ go run ./cmd/audit-demo
 | 非法事件隔离 | `ingest.TestInvalidEventQuarantined` |
 | 非法规则/作用域冲突拒绝且不污染生效态 | `rules.TestValidateRuleSet`、`service.TestInvalidPublishDoesNotPollute` |
 | 版本选择、发布、回滚、历史重算复现 | `engine.TestEvaluateUsesVersionAtOccurrenceAndRecompute`、`engine.TestRollbackReproducesOldConclusion`、`service.TestEndToEndRollbackAndRecompute` |
+| 预演不改状态、候选非法同样被拒 | `service.TestDryRunPublishDoesNotMutateState` |
+| 回滚预演、无可回滚版本明确失败 | `service.TestDryRunRollbackPreview` |
+| 生效时间轴边界、按时刻追溯唯一命中 | `rules.TestTimelineBoundariesAndEffectiveAt`、`service.TestServiceTimelineReflectsRollback` |
+| 回滚后新事件/乱序事件在当前查询可见 | `service.TestRollbackClosesLoopForNewEvents` |
 | 并发写入 + 规则切换 + 重算一致性 | `service.TestConcurrentWritesPublishAndRecompute`（`-race`） |
-| 越权访问拒绝、不泄露他租户数据 | `auth.TestAuthorizeMatrix`、`service.TestCrossTenantAndRoleBoundaries` |
+| 并发预演/回滚/发布/写入下结论唯一稳定 | `service.TestConcurrentDryRunRollbackAndIngest`（`-race`） |
+| 越权访问拒绝、不泄露他租户数据 | `auth.TestAuthorizeMatrix`、`service.TestCrossTenantAndRoleBoundaries`、`service.TestDryRunAndTimelineAuthorization` |
 | 限流与背压 | `ingest.TestBackpressureAndRateLimit` |
 
 单测通过 `t.Logf` 打印关键输入（幂等键/金额/发生时间）、规则版本、
@@ -173,5 +213,22 @@ go run ./cmd/audit-demo
   严格可复现”，且每个槽位只写一次，天然抵御并发静默改写。
 - “当前查询”与“按发生时版本复现”是两个显式视角：前者随发布/回滚切换，
   后者由不可变历史槽位保证；重算只补缺槽，不推翻任何既有结论。
+- 生效时间轴用“追加生效记录 + 半开区间展开”实现：发布/回滚只追加记录，
+  从不修改历史区间，因此任意时刻的生效版本可确定性地重放。
+- 预演复用判定纯函数 `applyRules`，与正式判定共享同一份逻辑，
+  从源头保证“预演看到的就是发布后会发生的”。
 - 内存实现面向本地离线与可测试性；接口（`EventStore/ResultStore/
   QuarantineStore/Registry/Authorizer`）均已抽象，可替换为持久化实现。
+
+## 兼容范围
+
+本次新增能力（预演、时间轴、回滚闭环）对既有行为完全向后兼容：
+
+- 既有公开 API 签名不变，仅新增方法（`DryRunRules/DryRunRollback/
+  RuleTimeline/EffectiveRulesAt/RollbackTarget/Timeline`）；
+- 发布/回滚/重算/查询的既有语义不变：历史事件仍按发生时版本复现，
+  结果槽位仍只写一次，非法发布仍零副作用；
+- 唯一的行为补全：回滚被显式记录在生效时间轴上，因此“回滚生效时刻之后
+  发生的事件”按回滚后版本判定（此前该场景未定义）；接入路径会额外补齐
+  当前版本槽位，只增不改，不影响任何已存在槽位；
+- 预演为纯只读能力，不向既有查询路径引入任何新状态。

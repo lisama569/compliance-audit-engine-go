@@ -23,10 +23,10 @@ type Evaluator interface {
 
 // IngestResult 是单次接入的处理结论。
 type IngestResult struct {
-	Accepted     bool
-	Duplicate    bool                       // 完全重复：幂等返回，不产生重复有效记录
-	Quarantine   *model.QuarantinedEvent    // 被隔离事件（冲突/迟到/非法）
-	Result       *model.Result              // 新判定或重复事件的既有判定
+	Accepted   bool
+	Duplicate  bool                    // 完全重复：幂等返回，不产生重复有效记录
+	Quarantine *model.QuarantinedEvent // 被隔离事件（冲突/迟到/非法）
+	Result     *model.Result           // 新判定或重复事件的既有判定
 }
 
 // Limiter 为令牌桶限流接口。
@@ -49,10 +49,10 @@ type Ingester struct {
 
 // Config 为接入层配置。
 type Config struct {
-	MaxInflight int           // 并发处理上限，超出立即触发背压；<=0 表示不限制
-	RatePerSec  float64       // 每秒令牌数，<=0 表示不限流
-	RateBurst   int           // 令牌桶容量
-	LateGrace   time.Duration // 迟到宽限窗口，超过则隔离为 LATE
+	MaxInflight int              // 并发处理上限，超出立即触发背压；<=0 表示不限制
+	RatePerSec  float64          // 每秒令牌数，<=0 表示不限流
+	RateBurst   int              // 令牌桶容量
+	LateGrace   time.Duration    // 迟到宽限窗口，超过则隔离为 LATE
 	Clock       func() time.Time // 可选：系统时间来源（测试/演示注入）
 }
 

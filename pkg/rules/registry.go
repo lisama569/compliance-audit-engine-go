@@ -28,10 +28,15 @@ type Registry interface {
 	Publish(tenantID string, rs model.RuleSet) (model.RuleSet, error)
 	// Rollback 将当前生效版本回退到上一版本（历史版本不删除）。
 	Rollback(tenantID string) (model.RuleSet, error)
-	// EffectiveAt 返回事件发生时刻 t 生效的规则集（历史重算用）。
+	// RollbackTarget 返回“若现在回滚”将生效的历史版本，不修改任何状态。
+	RollbackTarget(tenantID string) (model.RuleSet, error)
+	// EffectiveAt 返回时刻 t 真正生效的规则集（含回滚生效段，历史重算用）。
 	EffectiveAt(tenantID string, t time.Time) (model.RuleSet, error)
 	// Current 返回当前生效规则集。
 	Current(tenantID string) (model.RuleSet, error)
 	// History 返回按版本号排序的全部已发布版本（含已回滚版本）。
 	History(tenantID string) []model.RuleSet
+	// Timeline 返回生效时间轴：每段为半开区间 [EffectiveFrom, EffectiveTo)，
+	// 任意时刻至多命中一个版本；回滚以 CauseRollback 段体现。
+	Timeline(tenantID string) []model.TimelineEntry
 }

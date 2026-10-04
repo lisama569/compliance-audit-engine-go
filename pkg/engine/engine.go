@@ -35,6 +35,10 @@ func New(reg rules.Registry, st *store.Memory, clocks ...func() time.Time) *Engi
 // Evaluate 用事件发生时的有效规则版本判定单条事件，
 // 并按 (事件, 规则版本) 维度持久化不可变结果。
 // 同一 (事件,版本) 重复求值时返回既有结果，保证幂等。
+//
+// 回滚闭环：若“发生时有效版本”与“当前生效版本”不同（例如回滚后
+// 才到达的乱序事件），同时按当前版本补齐结果槽位，保证新接入事件
+// 在当前版本查询中始终可见；槽位只写一次，重复调用不会改写。
 func (e *Engine) Evaluate(ev model.Event) (model.Result, error) {
 	rs, err := e.registry.EffectiveAt(ev.TenantID, ev.OccurredAt)
 	if err != nil {
@@ -48,6 +52,12 @@ func (e *Engine) Evaluate(ev model.Event) (model.Result, error) {
 		return model.Result{}, err
 	}
 	e.results.PutResult(r)
+	// 当前版本槽位补齐（已存在则 PutResult 内部拒绝覆盖）。
+	if cur, cerr := e.registry.Current(ev.TenantID); cerr == nil && cur.Version != rs.Version {
+		if _, err := e.EvaluateWith(ev, cur, false); err != nil {
+			return r, err
+		}
+	}
 	return r, nil
 }
 

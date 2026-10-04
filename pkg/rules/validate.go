@@ -8,8 +8,9 @@ import (
 )
 
 // 合法字段/操作符组合：
-//   amount_cents : GTE / LTE，值必须为 int64
-//   action / resource_id / actor : EQ，值为任意非空字符串
+//
+//	amount_cents : GTE / LTE，值必须为 int64
+//	action / resource_id / actor : EQ，值为任意非空字符串
 func validFieldForOp(field string, op model.RuleOp, value string) error {
 	switch op {
 	case model.OpGTE, model.OpLTE:

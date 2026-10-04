@@ -48,45 +48,99 @@ const (
 
 // Rule 是一条单版本规则；同一 RuleID 在不同 RuleSetVersion 中可被修订。
 type Rule struct {
-	RuleID    string   `json:"rule_id"`
-	Scope     string   `json:"scope"`
-	Action    string   `json:"action"`
-	Op        RuleOp   `json:"op"`
-	Field     string   `json:"field"`
-	Value     string   `json:"value"`
-	Decision  Decision `json:"decision"`
-	Reason    string   `json:"reason"`
+	RuleID   string   `json:"rule_id"`
+	Scope    string   `json:"scope"`
+	Action   string   `json:"action"`
+	Op       RuleOp   `json:"op"`
+	Field    string   `json:"field"`
+	Value    string   `json:"value"`
+	Decision Decision `json:"decision"`
+	Reason   string   `json:"reason"`
 }
 
 // RuleSet 是一个不可变的版本化规则集快照。
 type RuleSet struct {
-	TenantID string    `json:"tenant_id"`
-	Version  int       `json:"version"`
+	TenantID    string    `json:"tenant_id"`
+	Version     int       `json:"version"`
 	PublishedAt time.Time `json:"published_at"`
-	Note     string    `json:"note"`
-	Rules    []Rule    `json:"rules"`
+	Note        string    `json:"note"`
+	Rules       []Rule    `json:"rules"`
 }
 
 // Evidence 记录一条结论命中的规则，作为判定依据。
 type Evidence struct {
-	RuleID   string `json:"rule_id"`
-	Scope    string `json:"scope"`
-	Op       RuleOp `json:"op"`
-	Field    string `json:"field"`
-	Value    string `json:"value"`
-	Reason   string `json:"reason"`
+	RuleID string `json:"rule_id"`
+	Scope  string `json:"scope"`
+	Op     RuleOp `json:"op"`
+	Field  string `json:"field"`
+	Value  string `json:"value"`
+	Reason string `json:"reason"`
 }
 
 // Result 是单条事件在某一规则版本下的判定结果（不可变）。
 type Result struct {
-	TenantID       string    `json:"tenant_id"`
-	EventKey       string    `json:"event_key"`
-	Event          Event     `json:"event"`
-	Decision       Decision  `json:"decision"`
-	RuleVersion    int       `json:"rule_version"`
-	MatchedRules   []Evidence `json:"matched_rules"`
-	EvaluatedAt    time.Time `json:"evaluated_at"`
-	Recomputed     bool      `json:"recomputed"`
+	TenantID     string     `json:"tenant_id"`
+	EventKey     string     `json:"event_key"`
+	Event        Event      `json:"event"`
+	Decision     Decision   `json:"decision"`
+	RuleVersion  int        `json:"rule_version"`
+	MatchedRules []Evidence `json:"matched_rules"`
+	EvaluatedAt  time.Time  `json:"evaluated_at"`
+	Recomputed   bool       `json:"recomputed"`
+}
+
+// ActivationCause 标识一次规则版本生效记录的来源。
+type ActivationCause string
+
+const (
+	// CausePublish 由发布新版本触发的生效记录。
+	CausePublish ActivationCause = "publish"
+	// CauseRollback 由回滚到历史版本触发的生效记录。
+	CauseRollback ActivationCause = "rollback"
+)
+
+// TimelineEntry 是规则版本生效时间轴上的一段半开区间
+// [EffectiveFrom, EffectiveTo)：区间内任意时刻有且仅有本版本生效，
+// EffectiveTo 为零值表示该版本至今仍在生效。
+type TimelineEntry struct {
+	Version       int             `json:"version"`
+	EffectiveFrom time.Time       `json:"effective_from"`
+	EffectiveTo   time.Time       `json:"effective_to,omitempty"`
+	Cause         ActivationCause `json:"cause"`
+	Current       bool            `json:"current"`
+}
+
+// DryRunScenario 标识预演场景：发布候选规则集，或回滚到上一版本。
+type DryRunScenario string
+
+const (
+	// DryRunPublish 预演“若发布该候选规则集”。
+	DryRunPublish DryRunScenario = "publish"
+	// DryRunRollback 预演“若回滚到上一历史版本”。
+	DryRunRollback DryRunScenario = "rollback"
+)
+
+// DryRunItem 是单条已归并事件在预演规则下的结论对比（纯临时结论，不落库）。
+type DryRunItem struct {
+	EventKey        string     `json:"event_key"`
+	Event           Event      `json:"event"`
+	BaseVersion     int        `json:"base_version"`     // 对比基准：当前生效版本
+	BaseDecision    Decision   `json:"base_decision"`    // 基准版本下的既有/应有结论
+	PreviewDecision Decision   `json:"preview_decision"` // 候选规则下的临时结论
+	Changed         bool       `json:"changed"`          // 判定是否发生变化
+	MatchedRules    []Evidence `json:"matched_rules"`    // 预演命中依据
+}
+
+// DryRunReport 是一次规则变更预演的完整结果。
+// 预演只读：不修改生效规则、不写入任何判定结果槽位。
+type DryRunReport struct {
+	TenantID         string         `json:"tenant_id"`
+	Scenario         DryRunScenario `json:"scenario"`
+	BaseVersion      int            `json:"base_version"`      // 当前生效版本号
+	CandidateVersion int            `json:"candidate_version"` // 预演版本号（发布=下一版本号，回滚=目标历史版本号）
+	TotalEvents      int            `json:"total_events"`
+	ChangedCount     int            `json:"changed_count"`
+	Items            []DryRunItem   `json:"items"`
 }
 
 // RejectReason 描述无法归并事件的可区分原因。

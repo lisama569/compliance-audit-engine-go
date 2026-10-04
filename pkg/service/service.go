@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/lisama569/compliance-audit-engine-go/pkg/auth"
 	"github.com/lisama569/compliance-audit-engine-go/pkg/engine"
@@ -136,6 +137,72 @@ func (s *Service) RuleHistory(p auth.Principal, tenantID string) ([]model.RuleSe
 		return nil, err
 	}
 	return s.registry.History(tenantID), nil
+}
+
+// DryRunRules 预演“若发布该候选规则集”：按租户已有事件预跑一遍，
+// 输出每条事件从当前版本结论到候选结论的变化及命中依据。
+// 只读操作：不修改生效规则、不写任何结果槽位；持租户串行锁，
+// 与写入/发布/回滚/重算互斥，保证预演快照前后一致。
+func (s *Service) DryRunRules(p auth.Principal, rs model.RuleSet) (model.DryRunReport, error) {
+	tenantID := rs.TenantID
+	if tenantID == "" {
+		tenantID = p.TenantID
+	}
+	if err := s.auth.Authorize(p, auth.ActionQuery, tenantID); err != nil {
+		return model.DryRunReport{}, err
+	}
+	rs.TenantID = tenantID
+	if err := rules.ValidateRuleSet(rs); err != nil {
+		return model.DryRunReport{}, err
+	}
+	unlock := s.lockTenant(tenantID)
+	defer unlock()
+
+	// 候选版本号 = 若现在发布会分配的下一版本号（仅为展示，不落库）。
+	rs.Version = len(s.registry.History(tenantID)) + 1
+	report, err := s.eng.DryRun(tenantID, rs)
+	if err != nil {
+		return model.DryRunReport{}, err
+	}
+	report.Scenario = model.DryRunPublish
+	return report, nil
+}
+
+// DryRunRollback 预演“若回滚到上一历史版本”：候选规则为回滚目标版本。
+// 没有可回滚版本时返回 rules.ErrNothingToRollback，状态完全不变。
+func (s *Service) DryRunRollback(p auth.Principal) (model.DryRunReport, error) {
+	if err := s.auth.Authorize(p, auth.ActionQuery, p.TenantID); err != nil {
+		return model.DryRunReport{}, err
+	}
+	unlock := s.lockTenant(p.TenantID)
+	defer unlock()
+
+	target, err := s.registry.RollbackTarget(p.TenantID)
+	if err != nil {
+		return model.DryRunReport{}, err
+	}
+	report, err := s.eng.DryRun(p.TenantID, target)
+	if err != nil {
+		return model.DryRunReport{}, err
+	}
+	report.Scenario = model.DryRunRollback
+	return report, nil
+}
+
+// RuleTimeline 鉴权后返回规则版本生效时间轴（半开区间，回滚可见）。
+func (s *Service) RuleTimeline(p auth.Principal, tenantID string) ([]model.TimelineEntry, error) {
+	if err := s.auth.Authorize(p, auth.ActionQuery, tenantID); err != nil {
+		return nil, err
+	}
+	return s.registry.Timeline(tenantID), nil
+}
+
+// EffectiveRulesAt 鉴权后返回任意时刻 t 真正生效的规则版本。
+func (s *Service) EffectiveRulesAt(p auth.Principal, tenantID string, t time.Time) (model.RuleSet, error) {
+	if err := s.auth.Authorize(p, auth.ActionQuery, tenantID); err != nil {
+		return model.RuleSet{}, err
+	}
+	return s.registry.EffectiveAt(tenantID, t)
 }
 
 // lockTenant 返回某租户的解锁函数；同租户所有写/重算路径借此串行化。

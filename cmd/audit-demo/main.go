@@ -124,12 +124,70 @@ func main() {
 	}
 	logger.Printf("[recompute] tenant=tenant-1 slotsFilled=%d", n)
 
-	// 回滚到 v1。
+	// 预演 1：若发布候选 v3（阈值收紧到 100000）会怎样？只读，不改任何状态。
+	dr, err := svc.DryRunRules(admin, model.RuleSet{TenantID: "tenant-1", Note: "candidate v3", Rules: []model.Rule{
+		{RuleID: "r-large-amount", Scope: "payments", Action: "transfer",
+			Op: model.OpGTE, Field: "amount_cents", Value: "100000",
+			Decision: model.DecisionDeny, Reason: "transfer exceeds risk threshold candidate"},
+		{RuleID: "r-normal", Scope: "payments", Action: "transfer",
+			Op: model.OpLTE, Field: "amount_cents", Value: "99999",
+			Decision: model.DecisionAllow, Reason: "within normal range candidate"},
+	}})
+	if err != nil {
+		log.Fatalf("dry-run publish failed: %v", err)
+	}
+	logger.Printf("[dryrun:publish] scenario=%s base=v%d candidate=v%d events=%d changed=%d",
+		dr.Scenario, dr.BaseVersion, dr.CandidateVersion, dr.TotalEvents, dr.ChangedCount)
+	for _, it := range dr.Items {
+		if it.Changed {
+			logger.Printf("[dryrun:publish] key=%s %s->%s evidence=%v",
+				it.EventKey, it.BaseDecision, it.PreviewDecision, it.MatchedRules)
+		}
+	}
+
+	// 预演 2：若回滚到上一版本会怎样？同样只读。
+	drr, err := svc.DryRunRollback(admin)
+	if err != nil {
+		log.Fatalf("dry-run rollback failed: %v", err)
+	}
+	logger.Printf("[dryrun:rollback] scenario=%s base=v%d target=v%d events=%d changed=%d",
+		drr.Scenario, drr.BaseVersion, drr.CandidateVersion, drr.TotalEvents, drr.ChangedCount)
+
+	// 回滚到 v1（11:30 生效，v2 的生效窗口为 [11:00, 11:30)）。
+	simClock.Set(base.Add(150 * time.Minute))
 	rb, err := svc.RollbackRules(admin)
 	if err != nil {
 		log.Fatalf("rollback failed: %v", err)
 	}
 	logger.Printf("[rollback] tenant=tenant-1 current=v%d", rb.Version)
+
+	// 回滚闭环：回滚后新发生的事件按回滚后当前版本（v1）判定，当前查询可见。
+	simClock.Set(base.Add(3 * time.Hour)) // 12:00
+	ingestOne("after-rollback-450000", mk("evt-7", simClock.Now(), 450000))
+
+	// 生效时间轴与按时刻追溯。
+	tl, err := svc.RuleTimeline(admin, "tenant-1")
+	if err != nil {
+		log.Fatalf("timeline failed: %v", err)
+	}
+	for _, e := range tl {
+		to := "now"
+		if !e.EffectiveTo.IsZero() {
+			to = e.EffectiveTo.Format(time.RFC3339)
+		}
+		logger.Printf("[timeline] version=v%d window=[%s,%s) cause=%s current=%t",
+			e.Version, e.EffectiveFrom.Format(time.RFC3339), to, e.Cause, e.Current)
+	}
+	eff, err := svc.EffectiveRulesAt(admin, "tenant-1", base.Add(75*time.Minute)) // 10:15，v1 首个窗口内
+	if err != nil {
+		log.Fatalf("effective-at failed: %v", err)
+	}
+	logger.Printf("[effective-at] t=10:15 -> ruleVersion=v%d", eff.Version)
+	eff, err = svc.EffectiveRulesAt(admin, "tenant-1", base.Add(135*time.Minute)) // 11:15，v2 窗口内
+	if err != nil {
+		log.Fatalf("effective-at failed: %v", err)
+	}
+	logger.Printf("[effective-at] t=11:15 -> ruleVersion=v%d", eff.Version)
 
 	// 查询：当前版本（v1）、历史 v2、隔离区。
 	show := func(tag string, p auth.Principal, tenant string, ver int) {
