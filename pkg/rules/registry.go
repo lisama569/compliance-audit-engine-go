@@ -34,4 +34,7 @@ type Registry interface {
 	Current(tenantID string) (model.RuleSet, error)
 	// History 返回按版本号排序的全部已发布版本（含已回滚版本）。
 	History(tenantID string) []model.RuleSet
+	// Timeline 返回规则版本的生效时间轴：每个版本从何时生效、何时被
+	// 下一版本/回滚接替；区间为半开 [From, To)，回滚段也会体现。
+	Timeline(tenantID string) []model.VersionInterval
 }

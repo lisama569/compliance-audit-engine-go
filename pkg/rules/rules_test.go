@@ -139,3 +139,108 @@ func TestTenantIsolation(t *testing.T) {
 		t.Fatalf("tenant t2 must be isolated, got err=%v", err)
 	}
 }
+
+func TestTimelineAndEffectiveAtBoundaries(t *testing.T) {
+	t0 := time.Date(2026, 9, 24, 8, 0, 0, 0, time.UTC)
+	t1 := t0.Add(2 * time.Hour)
+	t2 := t0.Add(4 * time.Hour)
+	cur := t0
+	reg := NewMemoryRegistry(func() time.Time { return cur })
+
+	if tl := reg.Timeline("t1"); tl != nil {
+		t.Fatalf("no publish yet, timeline must be empty, got %+v", tl)
+	}
+
+	if _, err := reg.Publish("t1", model.RuleSet{Note: "v1", Rules: goodRules()}); err != nil {
+		t.Fatal(err)
+	}
+	cur = t1
+	if _, err := reg.Publish("t1", model.RuleSet{Note: "v2", Rules: goodRules()}); err != nil {
+		t.Fatal(err)
+	}
+	cur = t2
+	if _, err := reg.Rollback("t1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 时间轴：v1 生效 [t0,t1)，v2 生效 [t1,t2)，回滚后 v1 再生效 [t2,∞)。
+	tl := reg.Timeline("t1")
+	if len(tl) != 3 {
+		t.Fatalf("want 3 intervals (publish/publish/rollback), got %d: %+v", len(tl), tl)
+	}
+	for i, iv := range tl {
+		t.Logf("[timeline] interval#%d version=v%d from=%s to=%s cause=%s current=%v",
+			i, iv.Version, iv.From.Format(time.RFC3339), iv.To.Format(time.RFC3339), iv.Cause, iv.Current)
+	}
+	wantVersions := []int{1, 2, 1}
+	wantCauses := []string{"publish", "publish", "rollback"}
+	wantFrom := []time.Time{t0, t1, t2}
+	for i, iv := range tl {
+		if iv.Version != wantVersions[i] || iv.Cause != wantCauses[i] || !iv.From.Equal(wantFrom[i]) {
+			t.Fatalf("interval#%d want v%d/%s@%s, got %+v", i, wantVersions[i], wantCauses[i], wantFrom[i], iv)
+		}
+		if iv.Current != (i == 2) {
+			t.Fatalf("interval#%d current flag wrong: %+v", i, iv)
+		}
+		if i < 2 {
+			if !iv.To.Equal(wantFrom[i+1]) {
+				t.Fatalf("interval#%d must end where next begins, got to=%s", i, iv.To)
+			}
+		} else if !iv.To.IsZero() {
+			t.Fatalf("last interval must be open-ended, got to=%s", iv.To)
+		}
+	}
+
+	// 边界：半开区间 [From, To)，任意时刻至多命中一个版本。
+	cases := []struct {
+		at   time.Time
+		want int // 0 表示期望 ErrNoRuleSet
+	}{
+		{t0.Add(-time.Second), 0},
+		{t0, 1}, // 区间左端闭：生效时刻即命中新版本
+		{t1.Add(-time.Nanosecond), 1},
+		{t1, 2}, // 接替时刻归属新区间，不会同时命中 v1/v2
+		{t2.Add(-time.Nanosecond), 2},
+		{t2, 1}, // 回滚生效时刻起解析到回滚后版本
+		{t2.Add(time.Hour), 1},
+	}
+	for _, tc := range cases {
+		rs, err := reg.EffectiveAt("t1", tc.at)
+		if tc.want == 0 {
+			if !errors.Is(err, ErrNoRuleSet) {
+				t.Fatalf("effective@%s want ErrNoRuleSet, got v%d err=%v", tc.at, rs.Version, err)
+			}
+			continue
+		}
+		if err != nil || rs.Version != tc.want {
+			t.Fatalf("effective@%s want v%d, got v%d err=%v", tc.at, tc.want, rs.Version, err)
+		}
+		t.Logf("[effective] at=%s -> ruleVersion=v%d", tc.at.Format(time.RFC3339), rs.Version)
+	}
+
+	// 不变量：t0 之后任意采样时刻恰好命中一个区间。
+	for i := 0; i <= 480; i++ {
+		at := t0.Add(time.Duration(i) * time.Minute)
+		hits := 0
+		for _, iv := range tl {
+			if !at.Before(iv.From) && (iv.To.IsZero() || at.Before(iv.To)) {
+				hits++
+			}
+		}
+		if hits != 1 {
+			t.Fatalf("at=%s hit %d intervals, want exactly 1", at, hits)
+		}
+	}
+
+	// 已回滚到最早版本：再次回滚明确失败，且时间轴/当前版本不被改坏。
+	if _, err := reg.Rollback("t1"); !errors.Is(err, ErrNothingToRollback) {
+		t.Fatalf("want ErrNothingToRollback, got %v", err)
+	}
+	if tl2 := reg.Timeline("t1"); len(tl2) != 3 {
+		t.Fatalf("failed rollback must not alter timeline, got %d intervals", len(tl2))
+	}
+	if cur, err := reg.Current("t1"); err != nil || cur.Version != 1 {
+		t.Fatalf("failed rollback must not alter current, got v%d err=%v", cur.Version, err)
+	}
+	t.Log("[rollback] no earlier version: explicit ErrNothingToRollback, timeline/current unchanged")
+}

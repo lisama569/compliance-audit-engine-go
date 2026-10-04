@@ -15,8 +15,8 @@
 | `pkg/model` | 事件、规则、规则集、判定结果、隔离记录等领域类型；幂等键与内容指纹 |
 | `pkg/auth` | 基于租户 + 角色的静态授权矩阵 |
 | `pkg/store` | 事件/结果/隔离区的内存存储（互斥锁、按租户隔离、结果槽位不可变） |
-| `pkg/rules` | 版本化规则集注册表：严格校验、发布、回滚、按事件发生时间选取生效版本 |
-| `pkg/engine` | 规则判定纯函数、单事件评估、历史重算、规则切换后的当前结果补齐 |
+| `pkg/rules` | 版本化规则集注册表：严格校验、发布、回滚、生效时间轴、按时刻选取真正生效版本 |
+| `pkg/engine` | 规则判定纯函数、单事件评估、历史重算、规则切换后的当前结果补齐、规则变更预演 |
 | `pkg/ingest` | 事件接入：校验、幂等归并、乱序/迟到处理、隔离、令牌限流与信号量背压 |
 | `pkg/service` | 门面：串联鉴权 + 各组件，以租户为粒度串行化写入/切换/重算 |
 
@@ -80,9 +80,8 @@
 
 - 每次成功发布生成**不可变**版本快照，版本号单调递增（v1, v2, ...），
   并记录发布时间；发布返回值与内部快照均做防御性拷贝，调用方无法回写污染。
-- 事件判定使用**事件发生时刻已生效的最新版本**
-  （`Registry.EffectiveAt(occurredAt)`），因此规则更新后旧事件仍按其发生时
-  的版本复现结论。
+- 事件判定使用**事件发生时刻真正生效的版本**（`Registry.EffectiveAt(occurredAt)`，
+  以发布/回滚构成的激活日志为准），因此规则更新后旧事件仍按其发生时的版本复现结论。
 - **回滚**只把“当前生效指针”移到上一版本，不删除任何历史版本；回滚后
   再发布仍在序列尾部递增版本号（v3 ...）。
 - 结果以 `(事件, 规则版本)` 为槽位存储且**只写一次、不可覆盖**：
@@ -91,6 +90,52 @@
   - 已存在槽位严格保留原结论，重算天然幂等（第二次重算补齐数为 0）。
 - 查询时 `ruleVersion <= 0` 表示当前生效版本；显式传版本号查询该历史版本结论，
   结果中 `Recomputed` 标记该槽位是否由重算补齐。
+
+### 规则变更预演（只读）
+
+发布新规则或回滚之前，可以先按本租户**已有审计事件**预跑一遍：
+
+- `Service.PreviewPublish(候选规则集)`：预演“若发布该规则集”。候选规则集先经过
+  与正式发布**相同的严格校验**，非法规则集直接预演失败；
+- `Service.PreviewRollback()`：预演“若回滚到上一版本”。没有可回滚版本时返回
+  `rules.ErrNothingToRollback`，状态不变。
+
+预演报告（`model.PreviewReport`）逐事件给出：当前生效版本下的结论（`Before`，
+依据版本 `BaseVersion`）、候选规则集下的结论（`After`，候选版本
+`CandidateVersion`——预演发布时为将分配的下一个版本号）、是否翻转以及候选规则
+集下的命中依据。预演**只能看不能动**：
+
+- 不修改当前生效规则、不消耗版本号；
+- 不生成/覆盖任何判定结果槽位，预演结论不会混入正式查询
+  （对照组优先引用已持久化的当前版本结论，缺失时纯函数现算但不落库）；
+- 预演持有租户串行锁，期间的事件写入/发布/回滚/重算都被阻塞，
+  不会读到前后对不上的半截数据；
+- 预演是只读操作，按 `query` 动作鉴权（只读角色与全局审计员可用）。
+
+### 生效时间轴与按时刻追溯
+
+注册表为每个租户维护**激活日志**：每次发布、每次回滚都追加一条生效切换记录。
+
+- `Service.RuleTimeline(tenant)` 返回生效时间轴（`model.VersionInterval`）：
+  每个版本从何时生效（`From`）、何时被下一版本/回滚接替（`To`）、
+  区间由来（`Cause`: `publish`/`rollback`）、是否当前生效（`Current`）；
+  回滚产生的新段同样按时间顺序出现在时间轴上；
+- `Service.EffectiveVersionAt(tenant, t)` 返回 t 时刻**真正生效**的版本，
+  与事件判定使用的口径完全一致；
+- **边界约定**：区间为半开 `[From, To)`——接替时刻归属新区间，
+  任意时刻至多命中一个区间，不会同时命中两个互相矛盾的版本；
+  最后一段 `To` 为空（至今仍生效）。
+
+### 回滚之后的闭环
+
+- `EffectiveAt` 以激活日志为准：回滚生效后，**新发生**的事件按回滚后当前生效的
+  版本判定；回滚之前、旧版本实际生效过的时段仍解析到旧版本，历史结论严格可复现。
+- 回滚后接入的事件若**发生**在旧版本生效时段（迟到但在宽限窗口内），仍按发生时
+  版本判定并落入对应槽位；同时引擎会为**当前版本**一并补齐该事件的结果槽位，
+  保证当前查询一定能看到该事件——不会出现“判定用一个版本、当前查询却看不到”
+  的断层。
+- 没有更早版本可回滚时返回 `rules.ErrNothingToRollback`，当前版本、结果槽位与
+  时间轴全部保持原样，状态不被改坏。
 
 ## 三、权限边界
 
@@ -104,7 +149,10 @@
 
 - 租户角色访问他租户资源一律返回 `auth.ErrForbidden`；
 - 越权拒绝不带任何他租户数据；存储层亦按 `tenant_id` 物理隔离（map 分桶）；
-- 全局审计员可跨租户只读查询，但任何写/重算/发布动作都被拒绝。
+- 全局审计员可跨租户只读查询，但任何写/重算/发布动作都被拒绝；
+- 预演（`PreviewPublish/PreviewRollback`）、时间轴（`RuleTimeline`）与按时刻追溯
+  （`EffectiveVersionAt`）均为只读能力，按 `query` 动作鉴权：只读角色与全局审计员
+  可用，跨租户访问同样被拒绝。
 
 ## 四、并发一致性与过载保护
 
@@ -144,8 +192,11 @@ go test -race ./...
 
 # 查看关键用例的诊断日志（输入 / 规则版本 / 判定依据 / 最终结果）
 go test ./pkg/service/ -run 'TestEndToEndRollbackAndRecompute|TestConcurrent' -v
+go test ./pkg/service/ -run 'TestPreviewDoesNotMutateState|TestRollbackClosedLoopForNewEvents' -v
+go test ./pkg/rules/ -run 'TestTimelineAndEffectiveAtBoundaries' -v
 
-# 端到端离线演示：重复、乱序/迟到、冲突、v2 发布、重算、回滚、越权、非法规则
+# 端到端离线演示：重复、乱序/迟到、冲突、v2 发布、预演、重算、回滚、
+# 回滚闭环、时间轴、越权、非法规则
 go run ./cmd/audit-demo
 ```
 
@@ -160,8 +211,13 @@ go run ./cmd/audit-demo
 | 非法事件隔离 | `ingest.TestInvalidEventQuarantined` |
 | 非法规则/作用域冲突拒绝且不污染生效态 | `rules.TestValidateRuleSet`、`service.TestInvalidPublishDoesNotPollute` |
 | 版本选择、发布、回滚、历史重算复现 | `engine.TestEvaluateUsesVersionAtOccurrenceAndRecompute`、`engine.TestRollbackReproducesOldConclusion`、`service.TestEndToEndRollbackAndRecompute` |
+| 预演不改状态（不发布/不写槽位/不混正式查询） | `service.TestPreviewDoesNotMutateState` |
+| 回滚后新事件判定与当前查询一致（闭环） | `service.TestRollbackClosedLoopForNewEvents` |
+| 时间轴边界（半开区间、回滚段、按时刻追溯） | `rules.TestTimelineAndEffectiveAtBoundaries` |
+| 回滚耗尽明确失败且状态不变 | `service.TestRollbackExhaustedFailsClean`、`rules.TestTimelineAndEffectiveAtBoundaries` |
 | 并发写入 + 规则切换 + 重算一致性 | `service.TestConcurrentWritesPublishAndRecompute`（`-race`） |
-| 越权访问拒绝、不泄露他租户数据 | `auth.TestAuthorizeMatrix`、`service.TestCrossTenantAndRoleBoundaries` |
+| 并发预演/时间轴 + 写入/发布/回滚/重算一致性 | `service.TestConcurrentPreviewPublishRollbackAndWrites`（`-race`） |
+| 越权访问拒绝、不泄露他租户数据 | `auth.TestAuthorizeMatrix`、`service.TestCrossTenantAndRoleBoundaries`、`service.TestPreviewAndTimelineAuthorization` |
 | 限流与背压 | `ingest.TestBackpressureAndRateLimit` |
 
 单测通过 `t.Logf` 打印关键输入（幂等键/金额/发生时间）、规则版本、
@@ -173,5 +229,16 @@ go run ./cmd/audit-demo
   严格可复现”，且每个槽位只写一次，天然抵御并发静默改写。
 - “当前查询”与“按发生时版本复现”是两个显式视角：前者随发布/回滚切换，
   后者由不可变历史槽位保证；重算只补缺槽，不推翻任何既有结论。
+- 预演复用判定纯函数而非另起一套逻辑：保证预演结论与正式发布/回滚后的
+  真实结论逐字一致；预演全程持租户锁且不落库，是“看得见的无副作用”。
 - 内存实现面向本地离线与可测试性；接口（`EventStore/ResultStore/
   QuarantineStore/Registry/Authorizer`）均已抽象，可替换为持久化实现。
+
+## 兼容性说明
+
+- 本次新增的预演、时间轴、按时刻追溯均为**纯新增接口**，既有
+  `Publish/Rollback/Recompute/Query` 等接口签名与语义不变。
+- `EffectiveAt` 的口径从“按发布时间取最新”细化为“按发布/回滚激活日志取
+  真正生效版本”：**未发生回滚时两者完全等价**，既有行为不受影响；
+  只有回滚之后，回滚时刻起的时间段才会解析到回滚后的版本（这正是闭环所需）。
+- 已持久化的历史结果槽位不受影响：旧事件在各历史版本下的结论依旧原样可查询。

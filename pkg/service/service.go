@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/lisama569/compliance-audit-engine-go/pkg/auth"
 	"github.com/lisama569/compliance-audit-engine-go/pkg/engine"
@@ -136,6 +137,76 @@ func (s *Service) RuleHistory(p auth.Principal, tenantID string) ([]model.RuleSe
 		return nil, err
 	}
 	return s.registry.History(tenantID), nil
+}
+
+// PreviewPublish 预演“若发布该规则集”对本租户已有事件的影响。
+//
+// 只读：不发布、不改当前生效规则、不写任何判定结果，报告不混入正式查询。
+// 候选规则集先经过与正式发布相同的严格校验，非法规则集直接预演失败。
+// 预演持有租户串行锁，期间的事件写入/规则切换/重算都被阻塞，
+// 保证不会读到前后对不上的半截数据。
+func (s *Service) PreviewPublish(p auth.Principal, rs model.RuleSet) (model.PreviewReport, error) {
+	tenantID := rs.TenantID
+	if tenantID == "" {
+		tenantID = p.TenantID
+	}
+	if err := s.auth.Authorize(p, auth.ActionQuery, tenantID); err != nil {
+		return model.PreviewReport{}, err
+	}
+	unlock := s.lockTenant(tenantID)
+	defer unlock()
+
+	rs.TenantID = tenantID
+	if err := rules.ValidateRuleSet(rs); err != nil {
+		return model.PreviewReport{}, err
+	}
+	return s.eng.PreviewTenant(tenantID, rs, "publish")
+}
+
+// PreviewRollback 预演“若回滚到上一版本”对本租户已有事件的影响。
+// 只读：不执行回滚、不写任何判定结果。没有可回滚版本时明确失败且状态不变。
+func (s *Service) PreviewRollback(p auth.Principal) (model.PreviewReport, error) {
+	if err := s.auth.Authorize(p, auth.ActionQuery, p.TenantID); err != nil {
+		return model.PreviewReport{}, err
+	}
+	unlock := s.lockTenant(p.TenantID)
+	defer unlock()
+
+	cur, err := s.registry.Current(p.TenantID)
+	if err != nil {
+		return model.PreviewReport{}, err
+	}
+	if cur.Version <= 1 {
+		return model.PreviewReport{}, rules.ErrNothingToRollback
+	}
+	// 版本号按发布顺序连续分配，回滚目标即当前版本的前一个版本。
+	var target model.RuleSet
+	for _, rs := range s.registry.History(p.TenantID) {
+		if rs.Version == cur.Version-1 {
+			target = rs
+			break
+		}
+	}
+	if target.Version == 0 {
+		return model.PreviewReport{}, rules.ErrNothingToRollback
+	}
+	return s.eng.PreviewTenant(p.TenantID, target, "rollback")
+}
+
+// RuleTimeline 鉴权后返回租户规则版本的生效时间轴（半开区间，含回滚段）。
+func (s *Service) RuleTimeline(p auth.Principal, tenantID string) ([]model.VersionInterval, error) {
+	if err := s.auth.Authorize(p, auth.ActionQuery, tenantID); err != nil {
+		return nil, err
+	}
+	return s.registry.Timeline(tenantID), nil
+}
+
+// EffectiveVersionAt 鉴权后返回 t 时刻真正生效的规则版本。
+func (s *Service) EffectiveVersionAt(p auth.Principal, tenantID string, t time.Time) (model.RuleSet, error) {
+	if err := s.auth.Authorize(p, auth.ActionQuery, tenantID); err != nil {
+		return model.RuleSet{}, err
+	}
+	return s.registry.EffectiveAt(tenantID, t)
 }
 
 // lockTenant 返回某租户的解锁函数；同租户所有写/重算路径借此串行化。

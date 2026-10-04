@@ -48,45 +48,45 @@ const (
 
 // Rule 是一条单版本规则；同一 RuleID 在不同 RuleSetVersion 中可被修订。
 type Rule struct {
-	RuleID    string   `json:"rule_id"`
-	Scope     string   `json:"scope"`
-	Action    string   `json:"action"`
-	Op        RuleOp   `json:"op"`
-	Field     string   `json:"field"`
-	Value     string   `json:"value"`
-	Decision  Decision `json:"decision"`
-	Reason    string   `json:"reason"`
+	RuleID   string   `json:"rule_id"`
+	Scope    string   `json:"scope"`
+	Action   string   `json:"action"`
+	Op       RuleOp   `json:"op"`
+	Field    string   `json:"field"`
+	Value    string   `json:"value"`
+	Decision Decision `json:"decision"`
+	Reason   string   `json:"reason"`
 }
 
 // RuleSet 是一个不可变的版本化规则集快照。
 type RuleSet struct {
-	TenantID string    `json:"tenant_id"`
-	Version  int       `json:"version"`
+	TenantID    string    `json:"tenant_id"`
+	Version     int       `json:"version"`
 	PublishedAt time.Time `json:"published_at"`
-	Note     string    `json:"note"`
-	Rules    []Rule    `json:"rules"`
+	Note        string    `json:"note"`
+	Rules       []Rule    `json:"rules"`
 }
 
 // Evidence 记录一条结论命中的规则，作为判定依据。
 type Evidence struct {
-	RuleID   string `json:"rule_id"`
-	Scope    string `json:"scope"`
-	Op       RuleOp `json:"op"`
-	Field    string `json:"field"`
-	Value    string `json:"value"`
-	Reason   string `json:"reason"`
+	RuleID string `json:"rule_id"`
+	Scope  string `json:"scope"`
+	Op     RuleOp `json:"op"`
+	Field  string `json:"field"`
+	Value  string `json:"value"`
+	Reason string `json:"reason"`
 }
 
 // Result 是单条事件在某一规则版本下的判定结果（不可变）。
 type Result struct {
-	TenantID       string    `json:"tenant_id"`
-	EventKey       string    `json:"event_key"`
-	Event          Event     `json:"event"`
-	Decision       Decision  `json:"decision"`
-	RuleVersion    int       `json:"rule_version"`
-	MatchedRules   []Evidence `json:"matched_rules"`
-	EvaluatedAt    time.Time `json:"evaluated_at"`
-	Recomputed     bool      `json:"recomputed"`
+	TenantID     string     `json:"tenant_id"`
+	EventKey     string     `json:"event_key"`
+	Event        Event      `json:"event"`
+	Decision     Decision   `json:"decision"`
+	RuleVersion  int        `json:"rule_version"`
+	MatchedRules []Evidence `json:"matched_rules"`
+	EvaluatedAt  time.Time  `json:"evaluated_at"`
+	Recomputed   bool       `json:"recomputed"`
 }
 
 // RejectReason 描述无法归并事件的可区分原因。

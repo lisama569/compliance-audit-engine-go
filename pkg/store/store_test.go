@@ -11,7 +11,7 @@ func mkEvent(tenant, id string, amount int64) model.Event {
 	return model.Event{
 		TenantID: tenant, Source: "payments", EventID: id,
 		OccurredAt: time.Date(2026, 9, 24, 9, 0, 0, 0, time.UTC),
-		Action: "transfer", AmountCents: amount,
+		Action:     "transfer", AmountCents: amount,
 	}
 }
 

@@ -117,6 +117,35 @@ func main() {
 	ingestOne("under-v2", mk("evt-5", v2.PublishedAt.Add(10*time.Minute), 250000))
 	ingestOne("denied-v2", mk("evt-6", v2.PublishedAt.Add(20*time.Minute), 320000))
 
+	// 预演发布 v3（阈值 400000）：只读报告，不发布、不写结果、不影响正式查询。
+	preview, err := svc.PreviewPublish(admin, model.RuleSet{Rules: []model.Rule{
+		{RuleID: "r-large-amount", Scope: "payments", Action: "transfer",
+			Op: model.OpGTE, Field: "amount_cents", Value: "400000",
+			Decision: model.DecisionDeny, Reason: "transfer exceeds risk threshold v3"},
+		{RuleID: "r-normal", Scope: "payments", Action: "transfer",
+			Op: model.OpLTE, Field: "amount_cents", Value: "399999",
+			Decision: model.DecisionAllow, Reason: "within normal range v3"},
+	}})
+	if err != nil {
+		log.Fatalf("preview publish failed: %v", err)
+	}
+	logger.Printf("[preview:publish] base=v%d candidate=v%d total=%d changed=%d",
+		preview.BaseVersion, preview.CandidateVersion, preview.Total, preview.Changed)
+	for _, c := range preview.Changes {
+		if c.Changed {
+			logger.Printf("[preview:publish] key=%s %s->%s (v%d->v%d)",
+				c.EventKey, c.Before, c.After, c.BaseVersion, preview.CandidateVersion)
+		}
+	}
+
+	// 预演回滚到 v1：只读，不执行回滚。
+	repRb, err := svc.PreviewRollback(admin)
+	if err != nil {
+		log.Fatalf("preview rollback failed: %v", err)
+	}
+	logger.Printf("[preview:rollback] base=v%d candidate=v%d total=%d changed=%d",
+		repRb.BaseVersion, repRb.CandidateVersion, repRb.Total, repRb.Changed)
+
 	// 历史重算：为每个历史版本补齐结果槽位。
 	n, err := svc.Recompute(ctx, admin, "tenant-1")
 	if err != nil {
@@ -125,11 +154,32 @@ func main() {
 	logger.Printf("[recompute] tenant=tenant-1 slotsFilled=%d", n)
 
 	// 回滚到 v1。
+	simClock.Set(base.Add(3 * time.Hour)) // 12:00 回滚
 	rb, err := svc.RollbackRules(admin)
 	if err != nil {
 		log.Fatalf("rollback failed: %v", err)
 	}
 	logger.Printf("[rollback] tenant=tenant-1 current=v%d", rb.Version)
+
+	// 回滚闭环：回滚后新发生的事件按回滚后当前生效的 v1 判定，当前查询可见。
+	ingestOne("post-rollback", mk("evt-7", base.Add(3*time.Hour+10*time.Minute), 320000))
+
+	// 生效时间轴与按时刻追溯。
+	tl, _ := svc.RuleTimeline(admin, "tenant-1")
+	for _, iv := range tl {
+		to := "open"
+		if !iv.To.IsZero() {
+			to = iv.To.Format(time.RFC3339)
+		}
+		logger.Printf("[timeline] v%d [%s, %s) cause=%s current=%t",
+			iv.Version, iv.From.Format(time.RFC3339), to, iv.Cause, iv.Current)
+	}
+	if eff, err := svc.EffectiveVersionAt(admin, "tenant-1", base.Add(2*time.Hour+30*time.Minute)); err == nil {
+		logger.Printf("[effective-at] 11:30 -> v%d", eff.Version)
+	}
+	if eff, err := svc.EffectiveVersionAt(admin, "tenant-1", base.Add(3*time.Hour+30*time.Minute)); err == nil {
+		logger.Printf("[effective-at] 12:30 -> v%d (post-rollback)", eff.Version)
+	}
 
 	// 查询：当前版本（v1）、历史 v2、隔离区。
 	show := func(tag string, p auth.Principal, tenant string, ver int) {
